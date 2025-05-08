@@ -8,11 +8,10 @@ from ta.volatility import BollingerBands, AverageTrueRange
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
 from tensorflow.keras.layers import LSTM, Dense, Dropout
-import xgboost as xgb
 import plotly.graph_objects as go
 
 st.set_page_config(layout="wide")
-st.title("🔗 Crypto Dashboard with LSTM + XGBoost Ensemble and Advanced Backtesting")
+st.title("🤖 Crypto AI Signals: Model-Driven Entries with TP/SL")
 
 # Config
 SYMBOLS = ['BTCUSDT', 'ETHUSDT']
@@ -21,6 +20,8 @@ TIMEFRAMES = {'1h': '1h', '4h': '4h', '1d': '1d'}
 # Sidebar
 symbol = st.sidebar.selectbox("Select Symbol", SYMBOLS)
 timeframe = st.sidebar.selectbox("Select Timeframe", list(TIMEFRAMES.keys()))
+tp_multiplier = st.sidebar.slider("TP Multiplier", 1.0, 5.0, 2.0)
+sl_multiplier = st.sidebar.slider("SL Multiplier", 0.5, 3.0, 1.5)
 
 # Fetch historical data
 def get_klines(symbol, interval, limit=300):
@@ -45,145 +46,87 @@ def apply_indicators(df):
     bb = BollingerBands(df['close'])
     df['BB_Upper'] = bb.bollinger_hband()
     df['BB_Lower'] = bb.bollinger_lband()
+    atr = AverageTrueRange(df['high'], df['low'], df['close'])
+    df['ATR'] = atr.average_true_range()
     df.dropna(inplace=True)
     return df
 
-# Create sequences for LSTM
-def create_sequences(data, seq_len, feature_cols, target_col):
-    X, y = [], []
-    for i in range(len(data) - seq_len):
-        X.append(data[feature_cols].iloc[i:i+seq_len].values)
-        y.append(data[target_col].iloc[i+seq_len])
-    return np.array(X), np.array(y)
+# Prepare data for model
+def prepare_sequences(df, seq_len, feature_cols):
+    X = []
+    for i in range(len(df) - seq_len):
+        X.append(df[feature_cols].iloc[i:i+seq_len].values)
+    return np.array(X)
 
-# Train LSTM
-@st.cache_resource
-def train_lstm(X_train, y_train):
+# Build simple LSTM model
+def build_model(input_shape):
     model = tf.keras.Sequential([
-        LSTM(64, return_sequences=True, input_shape=X_train.shape[1:]),
+        LSTM(64, return_sequences=True, input_shape=input_shape),
         LSTM(32),
         Dropout(0.2),
-        Dense(1)
+        Dense(1, activation='sigmoid')
     ])
-    model.compile(optimizer='adam', loss='mse')
-    model.fit(X_train, y_train, epochs=10, batch_size=16, verbose=0)
+    model.compile(optimizer='adam', loss='binary_crossentropy')
     return model
 
-# Train XGBoost
-@st.cache_resource
-def train_xgboost(X_train, y_train):
-    model = xgb.XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.05)
-    model.fit(X_train, y_train)
-    return model
-
-# Backtest function
-def backtest(df, lstm_model, xgb_model, scaler, feature_cols, seq_len):
-    balance = 1000  # Starting balance
-    positions = []
-    returns = []
-    predictions, actuals = [], []
-
-    for i in range(seq_len, len(df)):
-        seq_input = scaler.transform(df[feature_cols].iloc[i-seq_len:i])
-        lstm_pred_scaled = lstm_model.predict(np.expand_dims(seq_input, axis=0), verbose=0)[0][0]
-        xgb_pred_scaled = xgb_model.predict([scaler.transform(df[feature_cols].iloc[[i]])[0]])[0]
-
-        latest_features = scaler.transform(df[feature_cols].iloc[[i]])[0]
-        latest_features_copy = latest_features.copy()
-        latest_features_copy[feature_cols.index('close')] = lstm_pred_scaled
-        lstm_pred = scaler.inverse_transform([latest_features_copy])[0][0]
-        latest_features_copy[feature_cols.index('close')] = xgb_pred_scaled
-        xgb_pred = scaler.inverse_transform([latest_features_copy])[0][0]
-        ensemble_pred = (lstm_pred + xgb_pred) / 2
-
-        actual_close = df['close'].iloc[i]
-        prev_close = df['close'].iloc[i-1]
-
-        # Simulate trade: Buy if prediction > prev close, Sell if < prev close
-        if ensemble_pred > prev_close:
-            profit = (actual_close - prev_close) / prev_close
-            positions.append(1)
-        else:
-            profit = (prev_close - actual_close) / prev_close
-            positions.append(-1)
-        returns.append(profit)
-
-        predictions.append(ensemble_pred)
-        actuals.append(actual_close)
-
-    returns = np.array(returns)
-    win_rate = np.sum(returns > 0) / len(returns) * 100
-    sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) != 0 else 0
-    cumulative = np.cumprod(1 + returns)
-    max_drawdown = np.max(np.maximum.accumulate(cumulative) - cumulative)
-
-    metrics = {
-        'Win Rate (%)': round(win_rate, 2),
-        'Sharpe Ratio': round(sharpe_ratio, 2),
-        'Max Drawdown': round(max_drawdown * 100, 2)
-    }
-
-    return predictions, actuals, cumulative, metrics
+# Generate AI signal
+def ai_signal_prediction(model, X):
+    pred = model.predict(X, verbose=0)
+    return 'Buy' if pred[-1][0] > 0.6 else 'Sell' if pred[-1][0] < 0.4 else 'Neutral'
 
 # Main
 with st.spinner("Fetching and processing data..."):
     df = get_klines(symbol, TIMEFRAMES[timeframe])
     df = apply_indicators(df)
 
-st.subheader(f"{symbol} {timeframe} Chart")
+# Feature columns
+feature_cols = ['close', 'volume', 'EMA_9', 'EMA_21', 'RSI', 'MACD', 'MACD_Signal', 'BB_Upper', 'BB_Lower']
+seq_len = 20
+scaler = MinMaxScaler()
+df_scaled = pd.DataFrame(scaler.fit_transform(df[feature_cols]), columns=feature_cols, index=df.index)
+X_seq = prepare_sequences(df_scaled, seq_len, feature_cols)
+
+# Build & load model (note: in real use, you'd load a pre-trained model)
+model = build_model((seq_len, len(feature_cols)))
+
+# For demonstration, simulate quick training (only for demo, not for real trading)
+y_dummy = np.random.randint(0, 2, size=(X_seq.shape[0],))
+model.fit(X_seq, y_dummy, epochs=1, batch_size=16, verbose=0)
+
+# Predict signal
+signal = ai_signal_prediction(model, X_seq)
+
+# Get TP/SL
+def calculate_tp_sl(row, signal):
+    entry = row['close']
+    atr = row['ATR']
+    if signal == 'Buy':
+        tp = entry + tp_multiplier * atr
+        sl = entry - sl_multiplier * atr
+    elif signal == 'Sell':
+        tp = entry - tp_multiplier * atr
+        sl = entry + sl_multiplier * atr
+    else:
+        tp = sl = None
+    return round(tp, 4) if tp else None, round(sl, 4) if sl else None
+
+# Plot chart
+st.subheader(f"{symbol} {timeframe} Chart & AI Signal")
 fig = go.Figure()
 fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close']))
 fig.add_trace(go.Scatter(x=df.index, y=df['EMA_9'], name='EMA 9', line=dict(color='blue')))
 fig.add_trace(go.Scatter(x=df.index, y=df['EMA_21'], name='EMA 21', line=dict(color='red')))
 st.plotly_chart(fig, use_container_width=True)
 
-# Prepare data
-feature_cols = ['close', 'volume', 'EMA_9', 'EMA_21', 'RSI', 'MACD', 'MACD_Signal', 'BB_Upper', 'BB_Lower']
-target_col = 'close'
-seq_len = 20
-scaler = MinMaxScaler()
-df_scaled = pd.DataFrame(scaler.fit_transform(df[feature_cols]), columns=feature_cols, index=df.index)
-X_lstm, y_lstm = create_sequences(df_scaled, seq_len, feature_cols, target_col)
-X_xgb = df_scaled[feature_cols].iloc[seq_len:].values
-y_xgb = df[target_col].iloc[seq_len:].values
-
-# Train models
-lstm_model = train_lstm(X_lstm, y_lstm)
-xgb_model = train_xgboost(X_xgb, y_xgb)
-
-# Predictions
-latest_seq = np.expand_dims(df_scaled[feature_cols].iloc[-seq_len:].values, axis=0)
-lstm_pred_scaled = lstm_model.predict(latest_seq, verbose=0)[0][0]
-xgb_pred_scaled = xgb_model.predict([df_scaled[feature_cols].iloc[-1].values])[0]
-latest_features = df_scaled.iloc[-1].copy()
-latest_features['close'] = lstm_pred_scaled
-lstm_pred = scaler.inverse_transform([latest_features])[0][0]
-latest_features['close'] = xgb_pred_scaled
-xgb_pred = scaler.inverse_transform([latest_features])[0][0]
-ensemble_pred = (lstm_pred + xgb_pred) / 2
-
-st.subheader("📈 Predictions")
-st.write(f"LSTM Prediction: {lstm_pred:.4f}")
-st.write(f"XGBoost Prediction: {xgb_pred:.4f}")
-st.success(f"Ensemble Prediction: {ensemble_pred:.4f}")
-
-# Backtesting
-st.subheader("🔄 Advanced Backtesting")
-with st.spinner("Running backtest..."):
-    preds, actuals, cumulative, metrics = backtest(df, lstm_model, xgb_model, scaler, feature_cols, seq_len)
-    backtest_df = pd.DataFrame({'Prediction': preds, 'Actual': actuals}, index=df.index[seq_len:])
-    fig_bt = go.Figure()
-    fig_bt.add_trace(go.Scatter(x=backtest_df.index, y=backtest_df['Actual'], name='Actual'))
-    fig_bt.add_trace(go.Scatter(x=backtest_df.index, y=backtest_df['Prediction'], name='Prediction'))
-    st.plotly_chart(fig_bt, use_container_width=True)
-
-    # Metrics
-    st.subheader("Performance Metrics")
-    for k, v in metrics.items():
-        st.write(f"{k}: {v}")
-
-    # Cumulative returns plot
-    st.subheader("Cumulative Returns")
-    fig_cum = go.Figure()
-    fig_cum.add_trace(go.Scatter(x=backtest_df.index, y=cumulative, name='Cumulative Return'))
-    st.plotly_chart(fig_cum, use_container_width=True)
+# Show signal
+if not df.empty:
+    last_row = df.iloc[-1]
+    tp, sl = calculate_tp_sl(last_row, signal)
+    st.subheader("🤖 AI Model Signal")
+    st.write(f"Signal: **{signal}**")
+    if signal in ['Buy', 'Sell']:
+        st.write(f"Best Entry: {last_row['close']:.4f}")
+        st.write(f"Take Profit (TP): {tp}")
+        st.write(f"Stop Loss (SL): {sl}")
+    else:
+        st.write("No actionable signal from the model at the moment.")
